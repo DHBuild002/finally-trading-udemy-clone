@@ -1,0 +1,85 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Secret scanning — fail the build if a credential is committed anywhere in
+  # the history or the current diff.
+  # ---------------------------------------------------------------------------
+  gitleaks:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Belt-and-braces guard: block files that should never reach the public repo
+  # even if .gitignore is bypassed with `git add -f`.
+  # ---------------------------------------------------------------------------
+  forbidden-files:
+    name: Forbidden file guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert no secret / local files are tracked
+        run: |
+          set -euo pipefail
+          # .env.example is the only permitted dotenv file.
+          matches="$(
+            git ls-files \
+              | grep -E '(^|/)(\.env($|\..+)|.+\.pem$|.+\.key$|id_rsa$|id_ed25519$|secrets\.(json|ya?ml|toml)$|settings\.local\.json$|\.DS_Store$)' \
+              | grep -vE '(^|/)\.env\.example$' || true
+          )"
+          if [ -n "$matches" ]; then
+            echo "::error::Tracked files that must not be in the repo:"
+            printf '%s\n' "$matches"
+            exit 1
+          fi
+          echo "OK - no forbidden files tracked."
+
+      - name: Assert the runtime database is not committed
+        run: |
+          if git ls-files | grep -E 'finally\.db$|db/.*\.(db|sqlite3?)$'; then
+            echo "::error::A SQLite database file is tracked - it must be gitignored."
+            exit 1
+          fi
+          echo "OK - no database file tracked."
+
+  # ---------------------------------------------------------------------------
+  # Dependency vulnerability audit for the Python backend.
+  # ---------------------------------------------------------------------------
+  pip-audit:
+    name: Backend dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Export locked dependencies
+        working-directory: backend
+        run: uv export --frozen --no-emit-project --all-extras -o requirements.txt
+
+      - name: Audit
+        continue-on-error: true # surface advisories without blocking the build
+        uses: pypa/gh-action-pip-audit@v1.1.0
+        with:
+          inputs: backend/requirements.txt
